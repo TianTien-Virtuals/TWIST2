@@ -7,7 +7,8 @@ ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx
 
 # change the network interface name to your own that connects to the robot
 # net=enp0s31f6
-net=eno1
+net=enp4s0
+# net=eno1
 
 cd deploy_real
 
@@ -16,5 +17,10 @@ python server_low_level_g1_real.py \
     --net ${net} \
     --device cuda \
     --use_hand \
-    # --smooth_body 0.5
+    --smooth_body 0.27 \
+    # --kp_scale 0.5 \
+    # --kd_scale 1.5 \
+    # --robot_roll_offset_deg -1.75  # Correct robot IMU roll offset (negative to correct positive offset)
+    # --hand_type inspire \
+    # --hand_type dex3  # Use Dex3-1 hands instead
     # --record_proprio \

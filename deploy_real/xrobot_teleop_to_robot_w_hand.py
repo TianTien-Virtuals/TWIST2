@@ -79,14 +79,25 @@ def get_interpolated_obs(state_machine):
     
     return interp_obs
 
-def extract_mimic_obs_whole_body(qpos, last_qpos, dt=1/30):
-    """Extract whole body mimic observations from robot joint positions (35 dims)"""
+def extract_mimic_obs_whole_body(qpos, last_qpos, dt=1/30, roll_offset_rad=0.0):
+    """Extract whole body mimic observations from robot joint positions (35 dims)
+    
+    Args:
+        qpos: Current joint positions
+        last_qpos: Previous joint positions
+        dt: Time step
+        roll_offset_rad: Roll offset correction in radians (subtracted from roll)
+    """
     root_pos, last_root_pos = qpos[0:3], last_qpos[0:3]
     root_quat, last_root_quat = qpos[3:7], last_qpos[3:7]
     robot_joints = qpos[7:].copy()  # Make a copy to avoid modifying original
     base_vel = (root_pos - last_root_pos) / dt
     base_ang_vel = quat_diff_np(last_root_quat, root_quat, scalar_first=True) / dt
     roll, pitch, yaw = euler_from_quaternion_np(root_quat.reshape(1, -1), scalar_first=True)
+    
+    # Apply roll offset correction (subtract offset to correct for PICO calibration)
+    roll = roll - roll_offset_rad
+    
     # convert root vel to local frame
     base_vel_local = quat_rotate_inverse_np(root_quat, base_vel, scalar_first=True)
     base_ang_vel_local = quat_rotate_inverse_np(root_quat, base_ang_vel, scalar_first=True)
@@ -452,6 +463,7 @@ class XRobotTeleopToRobot:
     def get_teleop_data(self):
         """Get current teleop data from streamer"""
         if self.teleop_data_streamer is not None:
+            # print("body_pose_dict: ", self.teleop_dat/a_streamer.get_processed_body_data())
             return self.teleop_data_streamer.get_current_frame()
         return None, None, None, None, None
         
@@ -470,7 +482,11 @@ class XRobotTeleopToRobot:
         
         # Create mimic obs from retargeting
         if self.last_qpos is not None:
-            current_retarget_obs = extract_mimic_obs_whole_body(qpos, self.last_qpos, dt=self.measured_dt)
+            # Convert roll offset from degrees to radians
+            roll_offset_rad = np.deg2rad(self.args.roll_offset_deg)
+            current_retarget_obs = extract_mimic_obs_whole_body(
+                qpos, self.last_qpos, dt=self.measured_dt, roll_offset_rad=roll_offset_rad
+            )
         else:
             current_retarget_obs = DEFAULT_MIMIC_OBS[self.robot_name]
         
@@ -625,6 +641,12 @@ class XRobotTeleopToRobot:
             # Expect 35D mimic observations
             assert len(mimic_obs) == 35, f"Expected 35 mimic obs dims, got {len(mimic_obs)}"
             # Send to both keys for compatibility
+            # print(f"[Redis] Sending action_body_unitree_g1_with_hands: {mimic_obs.tolist()}")
+            # # Print summary: root_pos (3), roll/pitch/yaw (3), root_vel (3), root_ang_vel (3), dof_pos (23)
+            # print(f"[Redis] Sending action_body_unitree_g1_with_hands - "
+            #       f"root_pos: {mimic_obs[:3]}, rpy: {mimic_obs[3:6]}, "
+            #       f"root_vel: {mimic_obs[6:9]}, root_ang_vel: {mimic_obs[9:12]}, "
+            #       f"dof_pos[0:3]: {mimic_obs[12:15]}")
             self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(mimic_obs.tolist()))
         
         # Send hand action to redis
@@ -832,6 +854,12 @@ def parse_arguments():
         type=int,
         default=0,
         help="Measure and print detailed FPS statistics (0=disabled, 1=enabled).",
+    )
+    parser.add_argument(
+        "--roll_offset_deg",
+        type=float,
+        default=0.0,
+        help="Roll offset correction in degrees (subtracted from PICO roll). Positive value corrects for positive roll offset. Default: 0.0",
     )
     return parser.parse_args()
 

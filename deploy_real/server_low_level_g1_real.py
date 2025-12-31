@@ -15,6 +15,7 @@ import os
 from data_utils.rot_utils import quatToEuler
 
 from robot_control.dex_hand_wrapper import Dex3_1_Controller
+from robot_control.inspire_hand_wrapper import InspireHandController
 
 try:
     import onnxruntime as ort
@@ -100,8 +101,12 @@ class RealTimePolicyController(object):
                  device='cuda',
                  net='eno1',
                  use_hand=False,
+                 hand_type='dex3',
                  record_proprio=False,
-                 smooth_body=0.0):
+                 smooth_body=0.0,
+                 robot_roll_offset_deg=0.0,
+                 kp_scale=1.0,
+                 kd_scale=1.0):
         self.redis_client = None
         try:
             self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -113,8 +118,14 @@ class RealTimePolicyController(object):
         self.config = Config(config_path)
         self.env = G1RealWorldEnv(net=net, config=self.config)
         self.use_hand = use_hand
+        self.hand_type = hand_type.lower()
         if use_hand:
-            self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
+            if self.hand_type == 'inspire':
+                print("🤖 Using INSPIRE hand controller (FTP protocol)")
+                self.hand_ctrl = InspireHandController(net, re_init=False)
+            else:
+                print("🤖 Using Dex3-1 hand controller")
+                self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
 
         self.device = device
         self.policy = load_onnx_policy(policy_path, device)
@@ -127,6 +138,17 @@ class RealTimePolicyController(object):
         self.dof_vel_scale = 0.05
         self.dof_pos_scale = 1.0
         self.ankle_idx = [4, 5, 10, 11]
+        
+        # Robot IMU roll offset correction (convert degrees to radians)
+        self.robot_roll_offset_rad = np.deg2rad(robot_roll_offset_deg)
+        if abs(self.robot_roll_offset_rad) > 0:
+            print(f"🤖 Robot IMU roll offset correction: {robot_roll_offset_deg:.2f}° ({self.robot_roll_offset_rad:.6f} rad)")
+        
+        # PD gain scaling (for runtime adjustment)
+        self.kp_scale = kp_scale
+        self.kd_scale = kd_scale
+        if abs(self.kp_scale - 1.0) > 0.01 or abs(self.kd_scale - 1.0) > 0.01:
+            print(f"⚙️  PD gain scaling: kp_scale={kp_scale:.2f}, kd_scale={kd_scale:.2f}")
 
         # TWIST2 observation structure
         self.n_mimic_obs = 35        # 6 + 29 (modified: root_vel_xy + root_pos_z + roll_pitch + yaw_ang_vel + dof_pos)
@@ -198,13 +220,17 @@ class RealTimePolicyController(object):
                 dof_pos, dof_vel, quat, ang_vel, dof_temp, dof_tau, dof_vol = self.env.get_robot_state()
                 
                 rpy = quatToEuler(quat)
+                
+                # Apply robot IMU roll offset correction
+                rpy_corrected = rpy.copy()
+                rpy_corrected[0] = rpy[0] - self.robot_roll_offset_rad  # Subtract offset to correct positive bias
 
                 obs_dof_vel = dof_vel.copy()
                 obs_dof_vel[self.ankle_idx] = 0.0
 
                 obs_proprio = np.concatenate([
                     ang_vel * self.ang_vel_scale,
-                    rpy[:2], # 只使用 roll 和 pitch
+                    rpy_corrected[:2], # 只使用 roll 和 pitch (corrected)
                     (dof_pos - self.default_dof_pos) * self.dof_pos_scale,
                     obs_dof_vel * self.dof_vel_scale,
                     self.last_action
@@ -212,7 +238,7 @@ class RealTimePolicyController(object):
                 
                 state_body = np.concatenate([
                     ang_vel,
-                    rpy[:2],
+                    rpy_corrected[:2],  # Use corrected roll/pitch for monitoring too
                     dof_pos]) # 3+2+29 = 34 dims
 
                 self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(state_body.tolist()))
@@ -273,12 +299,31 @@ class RealTimePolicyController(object):
 
                 # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
 
-                kp_scale = 1.0
-                kd_scale = 1.0
-                self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
+                # Use configured PD gain scales
+                self.env.send_robot_action(target_dof_pos, self.kp_scale, self.kd_scale)
                 
                 if self.use_hand:
-                    self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
+                    if self.hand_type == 'inspire':
+                        # For INSPIRE hands, convert 7-DOF array to simple open/close position
+                        # The teleop sends 0.0-1.0 position, but it's converted to 7-DOF array
+                        # Extract position: use first value or average of first 4 values
+                        if len(action_hand_left) >= 4:
+                            left_pos = np.mean(action_hand_left[:4])
+                        else:
+                            left_pos = action_hand_left[0] if len(action_hand_left) > 0 else 0.0
+                        
+                        if len(action_hand_right) >= 4:
+                            right_pos = np.mean(action_hand_right[:4])
+                        else:
+                            right_pos = action_hand_right[0] if len(action_hand_right) > 0 else 0.0
+                        
+                        # Clamp to [0, 1] and use simple open/close interface
+                        left_pos = np.clip(left_pos, 0.0, 1.0)
+                        right_pos = np.clip(right_pos, 0.0, 1.0)
+                        self.hand_ctrl.ctrl_hand_open_close(left_pos, right_pos)
+                    else:
+                        # Dex3-1 uses full 7-DOF control
+                        self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
                 
                 elapsed = time.time() - t_start
                 if elapsed < self.control_dt:
@@ -334,10 +379,19 @@ def main():
                         help='Network interface for robot communication')
     parser.add_argument('--use_hand', action='store_true',
                         help='Enable hand control')
+    parser.add_argument('--hand_type', type=str, default='dex3',
+                        choices=['dex3', 'inspire'],
+                        help='Hand type: dex3 (Dex3-1) or inspire (INSPIRE FTP hand)')
     parser.add_argument('--record_proprio', action='store_true',
                         help='Record proprioceptive data')
     parser.add_argument('--smooth_body', type=float, default=0.0,
                         help='Smoothing factor for body actions (0.0=no smoothing, 1.0=maximum smoothing)')
+    parser.add_argument('--robot_roll_offset_deg', type=float, default=0.0,
+                        help='Robot IMU roll offset correction in degrees (negative to correct positive offset). Default: 0.0')
+    parser.add_argument('--kp_scale', type=float, default=1.0,
+                        help='Scale factor for all kp (proportional) gains. Default: 1.0 (no scaling)')
+    parser.add_argument('--kd_scale', type=float, default=1.0,
+                        help='Scale factor for all kd (derivative) gains. Default: 1.0 (no scaling)')
     
     args = parser.parse_args()
 
@@ -357,6 +411,8 @@ def main():
     print(f"  Device: {args.device}")
     print(f"  Network interface: {args.net}")
     print(f"  Use hand: {args.use_hand}")
+    if args.use_hand:
+        print(f"  Hand type: {args.hand_type}")
     print(f"  Record proprio: {args.record_proprio}")
     print(f"  Smooth body: {args.smooth_body}")
     
@@ -375,8 +431,12 @@ def main():
         device=args.device,
         net=args.net,
         use_hand=args.use_hand,
+        hand_type=args.hand_type,
         record_proprio=args.record_proprio,
         smooth_body=args.smooth_body,
+        robot_roll_offset_deg=args.robot_roll_offset_deg,
+        kp_scale=args.kp_scale,
+        kd_scale=args.kd_scale
     )
     
     controller.run()
