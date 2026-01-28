@@ -762,6 +762,42 @@ class XRobotTeleopToRobot:
                 if neck_data_to_send is not None:
                     self.state_machine.set_current_neck_data(neck_data_to_send)
                 
+                # Construct precise 35-dim array for Redis:
+                # - First 21 values (indices 0-20): Stationary/default pose
+                #   * Indices 0-5: Root control (xy_vel, z_pos, roll, pitch, yaw_ang_vel)
+                #   * Indices 6-11: Left leg joints
+                #   * Indices 12-17: Right leg joints  
+                #   * Indices 18-20: Waist joints
+                # - Last 14 values (indices 21-34): From pico
+                #   * Indices 21-27: Left arm joints (7 dims)
+                #   * Indices 28-34: Right arm joints (7 dims)
+                
+                # Get first 21 values from default stationary pose
+                first_21_stationary = DEFAULT_MIMIC_OBS[self.robot_name][:21].copy()
+                
+                # Get last 14 values from pico (indices 21-34: left arm + right arm)
+                # Extract from current_retarget_obs if available, otherwise use placeholder
+                if current_retarget_obs is not None and len(current_retarget_obs) >= 35:
+                    # Extract last 14 values (arms) from retargeted observation
+                    pico_data = mimic_obs_to_send[21:35].copy().astype(np.float32)
+                else:
+                    # Placeholder - REPLACE WITH ACTUAL PICO DATA SOURCE
+                    # pico_data must be exactly 14 dimensions: [left_arm_7dims, right_arm_7dims]
+                    pico_data = np.zeros(14, dtype=np.float32)
+                    # Alternative: Get from Redis if pico publishes there
+                    # try:
+                    #     pico_data_json = self.redis_client.get("pico_arm_data")
+                    #     if pico_data_json is not None:
+                    #         pico_data = np.array(json.loads(pico_data_json), dtype=np.float32)
+                    #         assert len(pico_data) == 14, f"Pico data must be 14 dims, got {len(pico_data)}"
+                    # except Exception as e:
+                    #     print(f"Warning: Could not get pico data: {e}, using zeros")
+                
+                # Combine precisely: [first_21_stationary (0-20), pico_data (21-34)]
+                mimic_obs_to_send = np.concatenate([first_21_stationary, pico_data]).astype(np.float32)
+                assert len(mimic_obs_to_send) == 35, f"Must be exactly 35 dims, got {len(mimic_obs_to_send)}"
+                
+                print(f"mimic_obs_to_send: {mimic_obs_to_send}")
                 self.send_to_redis(mimic_obs_to_send, neck_data_to_send)
                 
                 # Update visualization and record video
