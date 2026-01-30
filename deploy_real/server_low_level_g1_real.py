@@ -174,7 +174,8 @@ class RealTimePolicyController(object):
         print("Robot will hold default pos. If needed, do other checks here.")
 
     def run(self):
-        self.reset_robot()
+        # Optional: run reset_robot() to wait for Start/A and move to default pose first.
+        # self.reset_robot()
         print("Begin main TWIST2 policy loop. Press [Select] on remote to exit.")
 
         try:
@@ -272,13 +273,14 @@ class RealTimePolicyController(object):
                 target_dof_pos = self.default_dof_pos + raw_action * self.action_scale
 
                 # self.redis_client.set("action_low_level_unitree_g1", json.dumps(raw_action.tolist()))
+                self.redis_client.set("target_dof_pos_unitree_g1", json.dumps(target_dof_pos.tolist()))
 
                 kp_scale = 1.0
                 kd_scale = 1.0
-                self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
+                # self.env.send_robot_action(target_dof_pos, kp_scale, kd_scale)
                 
-                if self.use_hand:
-                    self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
+                # if self.use_hand:
+                #     self.hand_ctrl.ctrl_dual_hand(action_hand_left, action_hand_right)
                 
                 elapsed = time.time() - t_start
                 if elapsed < self.control_dt:
