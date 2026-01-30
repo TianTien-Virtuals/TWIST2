@@ -52,10 +52,11 @@ def cosine_decay_weight(init_weight, step, total_steps):
 
 class DaggerPPO:
     def __init__(self,
-                 env, 
+                 env,
                  actor_critic,
                  teacher_actor_critic,
                  teacher_loaded=False,
+                 base_policy=None,
                  dagger_coef=0.1,
                  dagger_coef_anneal_steps=30000,
                  dagger_coef_min=0.0,
@@ -83,6 +84,7 @@ class DaggerPPO:
         self.env = env
         self.device = device
         self.num_hist = num_hist
+        self.base_policy = base_policy  # optional: action = base(obs) + residual
 
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -135,8 +137,9 @@ class DaggerPPO:
     def act(self, obs, critic_obs, info, hist_encoding=False):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
-        # Compute the actions and values, use proprio to compute estimated priv_states then actions, but store true priv_states
-        self.transition.actions = self.actor_critic.act(obs).detach()
+        # Actor outputs residual when base_policy is set, else full action
+        residual = self.actor_critic.act(obs).detach()
+        self.transition.actions = residual
 
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
@@ -145,6 +148,10 @@ class DaggerPPO:
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
 
+        if self.base_policy is not None:
+            with torch.no_grad():
+                base_actions = self.base_policy(obs)
+            return (base_actions + residual).to(self.device)
         return self.transition.actions
     
     def process_env_step(self, rewards, dones, infos):

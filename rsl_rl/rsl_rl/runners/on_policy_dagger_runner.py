@@ -54,6 +54,27 @@ from rsl_rl.utils.normalizer import Normalizer
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
+
+
+def _make_base_policy_from_onnx(onnx_path, device):
+    """Load ONNX policy and return a callable (obs_tensor) -> (action_tensor) on device."""
+    if ort is None:
+        raise ImportError("onnxruntime is required for residual training. pip install onnxruntime")
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider", "CUDAExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    def base_policy(obs):
+        obs_np = obs.cpu().numpy().astype(np.float32)
+        if obs_np.ndim == 1:
+            obs_np = obs_np.reshape(1, -1)
+        out = session.run(None, {input_name: obs_np})[0]
+        return torch.from_numpy(out).to(device=device, dtype=obs.dtype)
+    return base_policy
+
 
 def get_policy_path(proj_name, exptid, checkpoint=-1):
     policy_dir = os.path.join(LEGGED_GYM_ROOT_DIR, "logs", proj_name, exptid)
@@ -114,6 +135,15 @@ class OnPolicyDaggerRunner:
             print(f"Teacher policy loaded: {teacher_policy_pth}")
         else:
             print("Evaluating student policy only, not loading teacher policy. KL loss will be disabled.")
+
+        # Optional base policy for residual training (action = base(obs) + residual)
+        self.base_policy = None
+        base_onnx = self.cfg.get("base_policy_onnx")
+        if base_onnx and os.path.isfile(base_onnx):
+            self.base_policy = _make_base_policy_from_onnx(base_onnx, self.device)
+            print(f"Residual training: base policy loaded from {base_onnx}")
+        elif base_onnx:
+            print(f"Warning: base_policy_onnx not found: {base_onnx}, training full policy.")
         
         policy_class = eval(self.cfg["policy_class_name"])
         if "Teleop" in self.cfg["policy_class_name"] or "Tracking" in self.cfg["policy_class_name"]:
@@ -157,10 +187,11 @@ class OnPolicyDaggerRunner:
             self.critic_normalizer = None
         
         alg_class = eval(self.cfg["algorithm_class_name"]) # DaggerPPO
-        self.alg = alg_class(self.env, 
+        self.alg = alg_class(self.env,
                                   actor_critic,
                                   self.teacher_actor_critic,
                                   teacher_loaded=self.teacher_loaded,
+                                  base_policy=self.base_policy,
                                   device=self.device, **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]

@@ -180,6 +180,9 @@ class G1MimicStuFutureCfgDAgger(G1MimicStuFutureCfg):
         teacher_proj_name = 'g1_priv_mimic'
         teacher_checkpoint = -1
         eval_student = False
+
+        # Residual training: path to base policy ONNX (action = base(obs) + residual). Set via --base_policy_onnx.
+        base_policy_onnx = None
         
         # Wandb model saving option
         save_to_wandb = False  # Set to False to disable wandb model saving
